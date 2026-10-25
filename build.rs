@@ -38,7 +38,8 @@ fn main() {
     }
 
     let cuda_path = locate_cuda();
-    let nvcc = cuda_path.join("bin").join("nvcc.exe");
+    let nvcc_name = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
+    let nvcc = cuda_path.join("bin").join(nvcc_name);
     if !nvcc.exists() {
         panic!(
             "nvcc not found at {}. Set CUDA_PATH/CUDA_HOME to the CUDA toolkit install directory.",
@@ -78,6 +79,17 @@ fn main() {
             for (key, value) in tool.env() {
                 cmd.env(key, value);
             }
+        } else {
+            // Newer glibc (2.39+, e.g. Ubuntu 24.04+/26.04) declares rsqrt/rsqrtf
+            // (and a few other IEC 60559 extension functions) under
+            // _GNU_SOURCE with a `noexcept` exception spec that conflicts
+            // with CUDA's own crt/math_functions.h declarations of the same
+            // symbols, causing nvcc's host-compiler pass to fail with
+            // "exception specification is incompatible". _DEFAULT_SOURCE
+            // still gives glibc's usual extensions without pulling in the
+            // IEC 60559 extension set that collides with CUDA's headers.
+            cmd.arg("-Xcompiler").arg("-U_GNU_SOURCE");
+            cmd.arg("-Xcompiler").arg("-D_DEFAULT_SOURCE");
         }
 
         let status = cmd
@@ -104,6 +116,19 @@ fn main() {
     };
     println!("cargo:rustc-link-search=native={}", cuda_lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=cudart");
+
+    // The nvcc-compiled kernel objects are emitted as C++ TUs (exception
+    // tables, `__gxx_personality_v0`, etc. even though the kernels
+    // themselves don't throw), but `cc::Build::compile` here only archives
+    // pre-built objects, so it never links libstdc++ the way it would for a
+    // crate it compiles from C++ sources itself. Without this, linking the
+    // final cdylib fails / produces an extension module with an unresolved
+    // `__gxx_personality_v0` symbol at import time.
+    if cfg!(all(unix, not(target_os = "macos"))) {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    } else if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-lib=dylib=c++");
+    }
 }
 
 fn locate_cuda() -> PathBuf {
