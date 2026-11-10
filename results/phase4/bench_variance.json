@@ -1,0 +1,90 @@
+{
+ "cosine_topk": {
+  "runs": 3,
+  "cells": 90,
+  "median_cv": 0.63,
+  "max_cv": 24.01,
+  "over5": 13,
+  "over10": 6
+ },
+ "fp8_quant": {
+  "runs": 3,
+  "cells": 96,
+  "median_cv": 0.33,
+  "max_cv": 8.18,
+  "over5": 3,
+  "over10": 0
+ },
+ "graph_message_passing": {
+  "runs": 3,
+  "cells": 81,
+  "median_cv": 0.6,
+  "max_cv": 38.74,
+  "over5": 16,
+  "over10": 7
+ },
+ "linear_cross_entropy": {
+  "runs": 3,
+  "cells": 27,
+  "median_cv": 0.99,
+  "max_cv": 3.61,
+  "over5": 0,
+  "over10": 0
+ },
+ "matmul_add_bias": {
+  "runs": 3,
+  "cells": 84,
+  "median_cv": 0.77,
+  "max_cv": 6.78,
+  "over5": 1,
+  "over10": 0
+ },
+ "moe_router": {
+  "runs": 3,
+  "cells": 90,
+  "median_cv": 5.73,
+  "max_cv": 15.26,
+  "over5": 52,
+  "over10": 11
+ },
+ "pairwise_distance": {
+  "runs": 3,
+  "cells": 120,
+  "median_cv": 1.9,
+  "max_cv": 17.16,
+  "over5": 32,
+  "over10": 12
+ },
+ "rmsnorm_residual": {
+  "runs": 3,
+  "cells": 90,
+  "median_cv": 0.3,
+  "max_cv": 8.73,
+  "over5": 10,
+  "over10": 0
+ },
+ "rope": {
+  "runs": 3,
+  "cells": 90,
+  "median_cv": 0.96,
+  "max_cv": 11.5,
+  "over5": 18,
+  "over10": 5
+ },
+ "swiglu": {
+  "runs": 3,
+  "cells": 90,
+  "median_cv": 0.16,
+  "max_cv": 10.33,
+  "over5": 3,
+  "over10": 1
+ },
+ "viterbi": {
+  "runs": 3,
+  "cells": 90,
+  "median_cv": 0.74,
+  "max_cv": 11.27,
+  "over5": 1,
+  "over10": 1
+ }
+}

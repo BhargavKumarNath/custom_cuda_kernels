@@ -1,6 +1,11 @@
 #include "../includes/common.cuh"
 #include "../includes/matmul_add_bias.h"
 
+#include <mma.h>
+#include <cstdint>
+#include <cstdlib>
+#include <type_traits>
+
 // -----------------------------------------------------------------------
 // Kernel 5 — Fused MatMul + Add Bias.
 //
@@ -163,10 +168,153 @@ __global__ void matmul_add_bias_kernel_blocked(
     }
 }
 
+// ---- v3: tensor-core path (WMMA, fp16/bf16 inputs, fp32 accumulate) ------
+//
+// Phase 4 attempt: the v2 kernel above is CUDA-core-only and cannot approach
+// cuBLAS's fp16/bf16 throughput. This kernel runs the same y = x @ W^T + b on
+// tensor cores. Block tile 128(M) x 128(N) x 32(K), 8 warps arranged 2(M) x
+// 4(N), each warp owns a 64x32 output tile (4x2 WMMA 16x16x16 fragments).
+// Global->shared copies use 16-byte cp.async into a 2-stage pipeline, and the
+// shared tiles are padded by 8 elements to avoid bank conflicts. No masking:
+// the path is taken only when M%128==0, N%128==0, K%32==0 and the pointers are
+// 16-byte aligned, otherwise dispatch falls back to v2.
+constexpr int kWmmaBM = 128;
+constexpr int kWmmaBN = 128;
+constexpr int kWmmaBK = 32;
+constexpr int kWmmaPad = 8;
+constexpr int kWmmaLd = kWmmaBK + kWmmaPad;  // 40 elements per smem row
+constexpr int kWmmaThreads = 256;
+
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
+    const unsigned int s = static_cast<unsigned int>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+template <typename T>
+__global__ void __launch_bounds__(kWmmaThreads) matmul_add_bias_kernel_wmma(
+    const T* __restrict__ x, const T* __restrict__ weight, const T* __restrict__ bias,
+    T* __restrict__ y, int64_t m, int64_t k, int64_t n) {
+    using namespace nvcuda;
+    extern __shared__ __align__(16) unsigned char wmma_smem_raw[];
+    T* smem = reinterpret_cast<T*>(wmma_smem_raw);
+    // stage s: A tile at s*2*tile, B tile right after.
+    constexpr int tile = kWmmaBM * kWmmaLd;
+    auto a_s = [&](int s) { return smem + (2 * s) * tile; };
+    auto b_s = [&](int s) { return smem + (2 * s + 1) * tile; };
+
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int wm = warp / 4;  // 0..1
+    const int wn = warp % 4;  // 0..3
+    const int64_t row0 = static_cast<int64_t>(blockIdx.y) * kWmmaBM;
+    const int64_t col0 = static_cast<int64_t>(blockIdx.x) * kWmmaBN;
+
+    auto load_stage = [&](int s, int64_t k0) {
+        // 128 rows x 4 chunks of 8 elements = 512 chunks per operand, 2 per thread.
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int c = tid + i * kWmmaThreads;
+            const int r = c / 4;
+            const int cc = (c % 4) * 8;
+            cp_async16(a_s(s) + r * kWmmaLd + cc, x + (row0 + r) * k + k0 + cc);
+            cp_async16(b_s(s) + r * kWmmaLd + cc, weight + (col0 + r) * k + k0 + cc);
+        }
+    };
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][2];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    const int num_kt = static_cast<int>(k / kWmmaBK);
+    load_stage(0, 0);
+    cp_async_commit();
+    for (int kt = 0; kt < num_kt; ++kt) {
+        if (kt + 1 < num_kt) {
+            load_stage((kt + 1) & 1, static_cast<int64_t>(kt + 1) * kWmmaBK);
+            cp_async_commit();
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
+        }
+        __syncthreads();
+        const T* as = a_s(kt & 1);
+        const T* bs = b_s(kt & 1);
+#pragma unroll
+        for (int ks = 0; ks < kWmmaBK; ks += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, T, wmma::row_major> af[4];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::col_major> bf[2];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) wmma::load_matrix_sync(af[i], as + (wm * 64 + i * 16) * kWmmaLd + ks, kWmmaLd);
+#pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(bf[j], bs + (wn * 32 + j * 16) * kWmmaLd + ks, kWmmaLd);
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], af[i], bf[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+    // Epilogue: stage each 16x16 fragment through shared memory (reusing the pipeline
+    // buffers, safe after the final __syncthreads), add bias, convert, store.
+    float* stage = reinterpret_cast<float*>(wmma_smem_raw) + warp * 256;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            wmma::store_matrix_sync(stage, acc[i][j], 16, wmma::mem_row_major);
+            __syncwarp();
+            const int r = lane / 2;
+            const int c8 = (lane % 2) * 8;
+            const int64_t gr = row0 + wm * 64 + i * 16 + r;
+            const int64_t gc = col0 + wn * 32 + j * 16 + c8;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                float v = stage[r * 16 + c8 + e];
+                if (bias != nullptr) v += to_float(bias[gc + e]);
+                y[gr * n + gc + e] = from_float<T>(v);
+            }
+            __syncwarp();
+        }
+    }
+}
+
+template <typename T>
+cudaError_t dispatch_wmma(
+    const T* x, const T* weight, const T* bias, T* y, int64_t m, int64_t k, int64_t n,
+    cudaStream_t stream) {
+    constexpr size_t smem_bytes = 4 * kWmmaBM * kWmmaLd * sizeof(T);  // 2 stages x (A + B) = 40960
+    static_assert(smem_bytes >= kWmmaThreads / 32 * 256 * sizeof(float), "epilogue staging must fit");
+    const dim3 grid(static_cast<unsigned int>(n / kWmmaBN), static_cast<unsigned int>(m / kWmmaBM));
+    cudaFuncSetAttribute(matmul_add_bias_kernel_wmma<T>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem_bytes));
+    matmul_add_bias_kernel_wmma<T><<<grid, kWmmaThreads, smem_bytes, stream>>>(x, weight, bias, y, m, k, n);
+    return cudaGetLastError();
+}
+
+// CUSTOM_CUDA_DISABLE_WMMA=1 forces the v2 CUDA-core kernel (used for A/B measurement).
+inline bool wmma_disabled() {
+    static const bool v = std::getenv("CUSTOM_CUDA_DISABLE_WMMA") != nullptr;
+    return v;
+}
+
+inline bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15u) == 0; }
+
 template <typename T>
 cudaError_t dispatch(
     const T* x, const T* weight, const T* bias, T* y, int64_t m, int64_t k, int64_t n,
     cudaStream_t stream) {
+    if constexpr (!std::is_same_v<T, float>) {
+        if (m % kWmmaBM == 0 && n % kWmmaBN == 0 && k % kWmmaBK == 0 && !wmma_disabled() && aligned16(x) && aligned16(weight)) {
+            return dispatch_wmma<T>(x, weight, bias, y, m, k, n, stream);
+        }
+    }
     if (m >= kBlockM && n >= kBlockN) {
         const dim3 block(kBlockN, kBlockM / kThreadM);
         const dim3 grid(static_cast<unsigned int>((n + kBlockN - 1) / kBlockN),

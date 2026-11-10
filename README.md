@@ -262,6 +262,38 @@ Performs dynamic scaling and FP8 conversion in a single pass.
 * **Implementation:** Each thread block computes the local maximum value, derives the scaling factor, and writes FP8 output directly. Vectorized stores pack sixteen FP8 values into a `uint4`.
 * **Result:** **3.1 to 11.7× faster** than a two-pass reference implementation while reaching **up to 87%** of the theoretical memory bandwidth limit for a single-pass kernel.
 
+## Phase 4: profiling, tensor cores, more kernels in the block, variance
+
+Raw results are in `results/phase4/`; scripts in `scripts/phase4/`, `benchmarks/phase4_matmul_tc.py` and `examples/llama_block_phase4.py`.
+
+**Why the below-target kernels are slow** (Nsight Compute; GPU counters need elevated permission, only `ncu` was run privileged):
+
+| Kernel / case | Duration | SM busy | DRAM | Achieved occupancy | Reading |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| MatMul+Bias, CUDA-core, QKV | 39 us | 50% | 5% | 33% | FMA pipe 15% busy; 66 registers/thread cap occupancy; no tensor cores |
+| Cosine Top-K, large pool | 7.9 us | 11% | 4% | 27% | 64 blocks = 0.3 waves/SM; L1 84%, stalled on loads |
+| Cosine Top-K, small pool | 750 us | 2% | 1% | 17% | 7 blocks cannot fill the GPU |
+| Pairwise distance, dim 1536 | 6.8 us | 55% | 1% | 66% | about 10,000 shared-memory bank conflicts per launch |
+| Graph message passing, N=100k | 614 us | 92% | 40% | 88% | L1/load throughput saturated |
+| Graph message passing, N=2k | 22 us | 52% | 19% | 69% | 1.2 waves/SM: not enough work |
+
+**Tensor-core MatMul+Bias** (WMMA, cp.async double buffering; `CUSTOM_CUDA_DISABLE_WMMA=1` selects the old path): 0.51x to 0.74x of cuBLAS speed in fp16/bf16 across 12 shapes, 5x to 9x faster than the CUDA-core kernel (0.07x to 0.13x of cuBLAS). Max error vs fp32 0.004 to 0.008 (fp16), 0.03 to 0.06 (bf16). fp32 still uses the CUDA-core kernel.
+
+**More kernels in the Llama-3-8B block** (bf16, seq 4096, 8 separate runs; the LM head uses a 32,000-token vocabulary and blocks share weights so it fits in 8 GB):
+
+| Variant | Median ms [min-max] | vs matching eager | Peak MB |
+| :--- | :--- | :--- | :--- |
+| Eager | 65.8 [63.6-66.3] | 1.00x | 1,136 |
+| Kernels 1+2+3 | 51.0 [49.1-53.6] | 1.28x (1.23-1.30) | 616 |
+| + tensor-core MatMul (4 kernels) | 93.5 [92.6-93.8] | 0.70x | 608 |
+| Eager + head + eager cross-entropy | 98.8 [95.3-101.0] | 1.00x | 1,136 |
+| Kernels 1+2+3 + fused linear cross-entropy | 80.3 [76.7-83.0] | 1.23x (1.19-1.24) | 616 |
+| + tensor-core MatMul (5 kernels) | 121.9 [118.9-122.3] | 0.81x | 608 |
+
+Replacing cuBLAS-backed projections with a kernel at about 0.6x of cuBLAS makes the block slower; the fused cross-entropy kernel helps. Gains are not additive.
+
+**Run-to-run variance** (each benchmark script run 3 times in separate processes, `results/phase4/bench_variance.json`): median coefficient of variation 0.2% to 1.9% for most kernels, 5.7% for the MoE router; the worst single cell varies 39% (graph message passing, small N), 24% (Cosine Top-K) and 17% (pairwise distance). Sub-100-microsecond cases are noisy and their speedups should be read with that range in mind.
+
 ## Developer CLI (`custom_cuda_cli`)
 
 A `uv`-style command-line toolkit for evaluating, benchmarking, and auditing these kernels - not for running inference. Nine subcommands, all thin wrappers around the same `baselines/`, `tests/`, `benchmarks/`, and `scripts/` infrastructure documented above, so the CLI's numbers are always the exact numbers the underlying scripts would produce standalone.
